@@ -2,7 +2,8 @@ services:
   - type: worker
     name: telegram-cloner-bot
     env: python
-    buildCommand: pip install -r requirements.txt
+    runtime: python
+    buildCommand: pip install --no-cache-dir -r requirements.txt
     startCommand: python Bot.py
     envVars:
       - key: API_ID
@@ -15,3 +16,5 @@ services:
         sync: false
       - key: OWNER_ID
         sync: false
+      - key: PYTHON_VERSION
+        value: 3.11.11
