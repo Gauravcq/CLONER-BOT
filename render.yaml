@@ -3,7 +3,7 @@ services:
     name: telegram-cloner-bot
     env: python
     buildCommand: pip install -r requirements.txt
-    startCommand: python bot.py
+    startCommand: python Bot.py
     envVars:
       - key: API_ID
         sync: false
