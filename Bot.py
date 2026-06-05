@@ -4,7 +4,7 @@ Telegram Topic Cloner Bot v4.0
 Based on SRC bot methodology: Pyrogram copy_message() — server-side media transfer
 Zero disk download. Handles topics, forums, normal groups, albums, replies, everything.
 """
-
+from pyromod import listen
 import asyncio
 
 try:
