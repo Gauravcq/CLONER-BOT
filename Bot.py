@@ -375,57 +375,94 @@ async def get_messages_sorted(client: Client, chat_id: Union[int, str], topic_id
 
 async def get_topic_messages_sorted(client: Client, chat_id: Union[int, str], topic_id: int, min_id: int = 0) -> List[Message]:
     """Get messages from a specific topic using raw API."""
+    from pyrogram.raw.functions.messages import GetHistory as RawGetHistory
     messages = []
-    add_offset = 0
-    
+
     try:
         peer = await client.resolve_peer(chat_id)
-        
+        offset_id = 0
+
         while True:
             r = await client.invoke(
-                from pyrogram.raw.functions.messages import GetHistory(
+                RawGetHistory(
                     peer=peer,
-                    offset_id=0,
+                    offset_id=offset_id,
                     offset_date=0,
-                    add_offset=add_offset,
+                    add_offset=0,
                     limit=100,
                     max_id=0,
                     min_id=min_id,
                     hash=0,
-                ),
-                # For topics, we need to specify the thread
-                # Use reply_to parameter with top_msg_id
+                )
             )
-            
-            # Actually Pyrogram's get_messages with thread_id is better
-            # Let's use a different approach
-            break
-    
+
+            if not r.messages:
+                break
+
+            ids = [m.id for m in r.messages if hasattr(m, "id") and m.id > min_id]
+            if not ids:
+                break
+
+            # Filter to only messages belonging to this topic (reply_to.reply_to_top_id or reply_to.reply_to_msg_id == topic_id)
+            chunk = await client.get_messages(chat_id, ids)
+            for m in chunk:
+                if not m or not m.id:
+                    continue
+                # Check if message belongs to the topic
+                if m.topic:
+                    # pyrogram sets m.topic on forum topic messages
+                    pass
+                reply = getattr(m, "reply_to_message_id", None) or getattr(m, "reply_to_top_message_id", None)
+                # Include message if it's in this topic
+                # In forums, topic_id == the thread root message id
+                raw_msg = next((x for x in r.messages if getattr(x, "id", None) == m.id), None)
+                if raw_msg:
+                    reply_to = getattr(raw_msg, "reply_to", None)
+                    if reply_to:
+                        top = getattr(reply_to, "reply_to_top_id", None) or getattr(reply_to, "reply_to_msg_id", None)
+                        if top == topic_id or m.id == topic_id:
+                            messages.append(m)
+                    else:
+                        # No reply_to means it could be the root topic message itself
+                        if m.id == topic_id:
+                            messages.append(m)
+
+            if len(r.messages) < 100:
+                break
+
+            offset_id = r.messages[-1].id
+
     except Exception as e:
-        logger.error(f"Error fetching topic messages: {e}")
-    
-    # Fallback: use Pyrogram's get_messages with topic_id via top_msg_id
-    try:
-        offset = 0
-        while True:
-            msgs = await client.get_messages(
-                chat_id,
-                limit=100,
-                offset_id=0,
-                offset=offset,
-                # topic_id parameter (Pyrogram >= 2.x)
-            )
-            if not msgs:
-                break
-            for m in msgs:
-                if m.id > min_id:
-                    messages.append(m)
-            if len(msgs) < 100:
-                break
-            offset += 100
-    except Exception:
-        pass
-    
+        logger.error(f"Error fetching topic messages (raw): {e}")
+
+    # Fallback: if raw approach got nothing, fetch all and filter by topic
+    if not messages:
+        try:
+            offset_id = 0
+            while True:
+                chunk = await client.get_messages(
+                    chat_id,
+                    limit=100,
+                    offset_id=offset_id if offset_id else 0,
+                )
+                if not chunk:
+                    break
+                for m in chunk:
+                    if not m or not m.id:
+                        continue
+                    if m.id <= min_id:
+                        continue
+                    # Check topic membership via reply_to
+                    if hasattr(m, "reply_to_message_id") and m.reply_to_message_id == topic_id:
+                        messages.append(m)
+                    elif m.id == topic_id:
+                        messages.append(m)
+                if len(chunk) < 100:
+                    break
+                offset_id = chunk[-1].id
+        except Exception as e:
+            logger.error(f"Error in fallback topic fetch: {e}")
+
     messages.sort(key=lambda m: m.id)
     return messages
 
