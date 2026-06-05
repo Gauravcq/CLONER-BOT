@@ -42,9 +42,12 @@ from pyrogram.types import (
 )
 from pyrogram.errors import (
     FloodWait, RPCError, FileReferenceExpired, FileReferenceInvalid,
-    TopicDeleted, TopicInvalid, ChatAdminRequired, ChannelPrivate,
+    ChatAdminRequired, ChannelPrivate,
     PeerIdInvalid, UsernameNotOccupied, InviteHashExpired, InviteHashInvalid
 )
+# TopicDeleted / TopicInvalid don't exist in pyrogram==2.0.106 — use RPCError as fallback
+TopicDeleted = RPCError
+TopicInvalid = RPCError
 from pyrogram.raw.functions.channels import CreateForumTopic, GetForumTopics
 from pyrogram.raw.types import InputPeerChannel, InputPeerChat
 from pyrogram.raw import types as raw_types
