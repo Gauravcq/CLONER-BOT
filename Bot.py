@@ -544,12 +544,16 @@ async def clone_topic(
                 if msg.reply_to_message_id:
                     reply_id = msg.reply_to_message_id
                 
-                await msg.copy(
+                copy_kwargs = dict(
                     chat_id=dest_id,
-                    reply_to_message_id=reply_id,
-                    message_thread_id=dest_topic_id,
                     disable_notification=True,
                 )
+                if reply_id:
+                    copy_kwargs["reply_to_message_id"] = reply_id
+                # message_thread_id not in pyrogram 2.0.106, use reply_to_message_id for topic root
+                if dest_topic_id and not reply_id:
+                    copy_kwargs["reply_to_message_id"] = dest_topic_id
+                await msg.copy(**copy_kwargs)
                 
                 done += 1
                 job.cloned_messages += 1
@@ -641,7 +645,6 @@ async def start_cmd(client: Client, message: Message):
     await message.reply_text(text)
 
 
-@app.on_message(filters.command("help"))
 async def help_cmd(client: Client, message: Message):
     text = (
         "📖 **How to use:**\n\n"
@@ -664,7 +667,6 @@ async def help_cmd(client: Client, message: Message):
     await message.reply_text(text)
 
 
-@app.on_message(filters.command("cancel"))
 async def cancel_cmd(client: Client, message: Message):
     uid = message.from_user.id if message.from_user else message.sender_chat.id
     key = str(uid)
@@ -676,7 +678,6 @@ async def cancel_cmd(client: Client, message: Message):
         await message.reply_text("❌ No active clone job.")
 
 
-@app.on_message(filters.command("status"))
 async def status_cmd(client: Client, message: Message):
     uid = message.from_user.id if message.from_user else message.sender_chat.id
     key = str(uid)
@@ -700,7 +701,6 @@ async def status_cmd(client: Client, message: Message):
         await message.reply_text("❌ No active clone. Use `/clone` to start one.")
 
 
-@app.on_message(filters.command("clone"))
 async def clone_cmd(client: Client, message: Message):
     uid = message.from_user.id if message.from_user else message.sender_chat.id
     
@@ -955,23 +955,23 @@ async def main():
         in_memory=True,
     )
     
-    # Register all handlers
-    
-    async def _start(client, message):
-        await start_cmd(client, message)
-    
-    async def _help(client, message):
-        await help_cmd(client, message)
-    
-    async def _clone(client, message):
-        await clone_cmd(client, message)
-    
-    async def _cancel(client, message):
-        await cancel_cmd(client, message)
-    
-    async def _status(client, message):
-        await status_cmd(client, message)
-    
+    # Register all handlers AFTER app is initialized
+    app.add_handler(__import__('pyrogram.handlers', fromlist=['MessageHandler']).MessageHandler(
+        start_cmd, filters.command("start") & filters.private
+    ))
+    app.add_handler(__import__('pyrogram.handlers', fromlist=['MessageHandler']).MessageHandler(
+        help_cmd, filters.command("help")
+    ))
+    app.add_handler(__import__('pyrogram.handlers', fromlist=['MessageHandler']).MessageHandler(
+        clone_cmd, filters.command("clone") & filters.private
+    ))
+    app.add_handler(__import__('pyrogram.handlers', fromlist=['MessageHandler']).MessageHandler(
+        cancel_cmd, filters.command("cancel") & filters.private
+    ))
+    app.add_handler(__import__('pyrogram.handlers', fromlist=['MessageHandler']).MessageHandler(
+        status_cmd, filters.command("status") & filters.private
+    ))
+
     await app.start()
     bot_me = await app.get_me()
     print(f"✅ Bot client logged in as: @{bot_me.username}")
