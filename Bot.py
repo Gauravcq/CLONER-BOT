@@ -1,992 +1,726 @@
 #!/usr/bin/env python3
-"""
-Telegram Topic Cloner Bot v4.0
-Based on SRC bot methodology: Pyrogram copy_message() — server-side media transfer
-Zero disk download. Handles topics, forums, normal groups, albums, replies, everything.
-"""
+# ╔══════════════════════════════════════════════════════════════════╗
+# ║        UNIVERSAL TELEGRAM CLONER BOT — by Gourav Rajput         ║
+# ║   Clones Groups / Channels / Forums / Topic Groups              ║
+# ║   Server-side copy · No disk usage · Full topic support         ║
+# ╚══════════════════════════════════════════════════════════════════╝
+
 import asyncio
-import sys
-
-# Fix for Python 3.10+ / pyromod compatibility: ensure event loop exists before any import
-try:
-    loop = asyncio.get_event_loop()
-    if loop.is_closed():
-        raise RuntimeError("Loop is closed")
-except RuntimeError:
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-
-# pyromod must be imported AFTER event loop is set
-from pyromod import listen
 import os
 import sys
 import json
 import re
 import time
 import logging
-import signal
-from datetime import datetime
-from typing import Dict, List, Optional, Tuple, Set, Any, Union
+from typing import Dict, List, Optional, Tuple, Set, Union
 from pathlib import Path
 from dataclasses import dataclass, field
 
-# ====== TELEGRAM CLIENTS ======
+# ── Fix asyncio event loop BEFORE any third-party import ──────────
+try:
+    _loop = asyncio.get_event_loop()
+    if _loop.is_closed():
+        raise RuntimeError
+except RuntimeError:
+    _loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(_loop)
+
+# ── Pyrogram ───────────────────────────────────────────────────────
 from pyrogram import Client, filters, enums
+from pyrogram.handlers import MessageHandler, CallbackQueryHandler
 from pyrogram.types import (
-    Message,
-    ChatPrivileges,
-    InlineKeyboardMarkup,
-    InlineKeyboardButton,
-    CallbackQuery,
-    Chat
+    Message, Chat, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 )
 from pyrogram.errors import (
-    FloodWait, RPCError, FileReferenceExpired, FileReferenceInvalid,
+    FloodWait, RPCError,
+    FileReferenceExpired, FileReferenceInvalid,
     ChatAdminRequired, ChannelPrivate,
-    PeerIdInvalid, UsernameNotOccupied, InviteHashExpired, InviteHashInvalid
+    PeerIdInvalid, UsernameNotOccupied,
+    InviteHashExpired, InviteHashInvalid,
+    UserNotParticipant,
 )
-# TopicDeleted / TopicInvalid don't exist in pyrogram==2.0.106 — use RPCError as fallback
-TopicDeleted = RPCError
-TopicInvalid = RPCError
 from pyrogram.raw.functions.channels import CreateForumTopic, GetForumTopics
-from pyrogram.raw.types import InputPeerChannel, InputPeerChat
 from pyrogram.raw import types as raw_types
 
-# ====== CONFIG ======
-API_ID = int(os.environ.get("API_ID", 0))
-API_HASH = os.environ.get("API_HASH", "")
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
-STRING_SESSION = os.environ.get("STRING_SESSION", "")
-OWNER_ID = int(os.environ.get("OWNER_ID", 0))
+# ── pyromod (after loop fix) ───────────────────────────────────────
+from pyromod import listen
+
+# ══════════════════════════════════════════════════════════════════
+#  CONFIG
+# ══════════════════════════════════════════════════════════════════
+API_ID           = int(os.environ.get("API_ID", 0))
+API_HASH         = os.environ.get("API_HASH", "")
+BOT_TOKEN        = os.environ.get("BOT_TOKEN", "")
+STRING_SESSION   = os.environ.get("STRING_SESSION", "")
+OWNER_ID         = int(os.environ.get("OWNER_ID", 0))
 FORCESUB_CHANNEL = os.environ.get("FORCESUB_CHANNEL", "")
 
-# Validate
 if not all([API_ID, API_HASH, BOT_TOKEN, STRING_SESSION, OWNER_ID]):
-    print("❌ Missing required env vars: API_ID, API_HASH, BOT_TOKEN, STRING_SESSION, OWNER_ID")
-    print("   STRING_SESSION = Pyrogram string session of your user account")
-    print("   Get it from: https://t.me/StringSessionBot")
+    print("MISSING ENV VARS: API_ID, API_HASH, BOT_TOKEN, STRING_SESSION, OWNER_ID")
     sys.exit(1)
 
-# ====== LOGGING ======
+# ══════════════════════════════════════════════════════════════════
+#  LOGGING
+# ══════════════════════════════════════════════════════════════════
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[logging.StreamHandler()]
+    handlers=[logging.StreamHandler()],
 )
-logger = logging.getLogger(__name__)
+log = logging.getLogger("ClonerBot")
 
-# ====== PROGRESS TRACKING ======
-CLONE_DIR = Path("clone_progress")
-CLONE_DIR.mkdir(exist_ok=True)
+# ══════════════════════════════════════════════════════════════════
+#  GLOBALS
+# ══════════════════════════════════════════════════════════════════
+bot:  Client = None
+user: Client = None
+
+active_jobs:  Dict[str, "CloneJob"] = {}
+cancel_flags: Dict[str, bool]       = {}
+
+# ══════════════════════════════════════════════════════════════════
+#  DATA CLASSES
+# ══════════════════════════════════════════════════════════════════
+@dataclass
+class TopicMeta:
+    id:            int
+    title:         str
+    icon_color:    int = 0
+    icon_emoji_id: int = 0
 
 @dataclass
 class CloneJob:
-    source_id: int
-    dest_id: int
-    source_name: str = ""
-    dest_name: str = ""
-    source_type: str = ""
-    dest_type: str = ""
-    topics: List[Dict] = field(default_factory=list)
-    current_topic_index: int = 0
-    last_msg_id: Dict[str, int] = field(default_factory=dict)
-    completed_topics: Set[str] = field(default_factory=set)
-    total_messages: int = 0
-    cloned_messages: int = 0
-    start_time: float = 0.0
+    src_id:   int
+    dst_id:   int
+    src_name: str = ""
+    dst_name: str = ""
+    src_type: str = ""
+    dst_type: str = ""
+    topics:           List[Dict] = field(default_factory=list)
+    completed_topics: Set[str]   = field(default_factory=set)
+    last_msg_id:      Dict[str, int] = field(default_factory=dict)
+    total_messages:   int   = 0
+    cloned_messages:  int   = 0
+    failed_messages:  int   = 0
+    start_time:       float = 0.0
+
+    _SAVE_DIR = Path("/tmp/clone_jobs")
+
+    def _path(self):
+        self._SAVE_DIR.mkdir(parents=True, exist_ok=True)
+        return self._SAVE_DIR / f"{self.src_id}_{self.dst_id}.json"
 
     def save(self):
-        data = {
-            "source_id": self.source_id,
-            "dest_id": self.dest_id,
-            "source_name": self.source_name,
-            "dest_name": self.dest_name,
-            "source_type": self.source_type,
-            "dest_type": self.dest_type,
-            "topics": self.topics,
-            "current_topic_index": self.current_topic_index,
-            "last_msg_id": self.last_msg_id,
-            "completed_topics": list(self.completed_topics),
-            "total_messages": self.total_messages,
-            "cloned_messages": self.cloned_messages,
-            "start_time": self.start_time,
-        }
-        path = CLONE_DIR / f"clone_{self.source_id}_{self.dest_id}.json"
-        with open(path, "w") as f:
-            json.dump(data, f, indent=2)
+        d = {k: (list(v) if isinstance(v, set) else v)
+             for k, v in self.__dict__.items() if not k.startswith("_")}
+        self._path().write_text(json.dumps(d, indent=2))
 
-    @staticmethod
-    def load(source_id: int, dest_id: int) -> Optional["CloneJob"]:
-        path = CLONE_DIR / f"clone_{source_id}_{dest_id}.json"
-        if path.exists():
-            try:
-                with open(path) as f:
-                    data = json.load(f)
-                job = CloneJob(data["source_id"], data["dest_id"])
-                job.source_name = data.get("source_name", "")
-                job.dest_name = data.get("dest_name", "")
-                job.source_type = data.get("source_type", "")
-                job.dest_type = data.get("dest_type", "")
-                job.topics = data.get("topics", [])
-                job.current_topic_index = data.get("current_topic_index", 0)
-                job.last_msg_id = data.get("last_msg_id", {})
-                job.completed_topics = set(data.get("completed_topics", []))
-                job.total_messages = data.get("total_messages", 0)
-                job.cloned_messages = data.get("cloned_messages", 0)
-                job.start_time = data.get("start_time", 0.0)
-                return job
-            except (json.JSONDecodeError, KeyError):
-                pass
-        return None
+    @classmethod
+    def load(cls, src_id, dst_id):
+        p = cls._SAVE_DIR / f"{src_id}_{dst_id}.json"
+        if not p.exists():
+            return None
+        try:
+            d  = json.loads(p.read_text())
+            j  = cls(d["src_id"], d["dst_id"])
+            for k, v in d.items():
+                if k == "completed_topics":
+                    setattr(j, k, set(v))
+                elif k not in ("src_id", "dst_id"):
+                    setattr(j, k, v)
+            return j
+        except Exception:
+            return None
 
     def delete(self):
-        path = CLONE_DIR / f"clone_{self.source_id}_{self.dest_id}.json"
-        if path.exists():
-            path.unlink()
+        p = self._path()
+        if p.exists():
+            p.unlink()
 
+# ══════════════════════════════════════════════════════════════════
+#  HELPERS
+# ══════════════════════════════════════════════════════════════════
+def elapsed_str(sec: float) -> str:
+    s = int(sec)
+    h, m, s = s // 3600, (s % 3600) // 60, s % 60
+    return f"{h:02d}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
 
-# ====== CLIENTS ======
-user: Client = None   # User client (for accessing chats)
-app: Client = None    # Bot client (for commands)
+def pbar(done: int, total: int, w=14) -> str:
+    f = min(w, int(w * done / total)) if total else 0
+    return "█" * f + "░" * (w - f)
 
-# Active clone jobs
-active_jobs: Dict[str, CloneJob] = {}
-cancel_event = asyncio.Event()
-
-
-# ====== HELPER FUNCTIONS ======
-
-def get_progress_text(job: CloneJob, topic_name: str, done: int, total: int, speed: float, eta: float) -> str:
-    pct = (done / total * 100) if total > 0 else 0
-    bar_len = 15
-    filled = min(bar_len, int(bar_len * pct / 100))
-    bar = "█" * filled + "░" * (bar_len - filled)
-    
+def progress_text(job: CloneJob, topic: str, done: int, total: int) -> str:
+    pct     = done / total * 100 if total else 0
     elapsed = time.time() - job.start_time
-    elapsed_str = f"{int(elapsed // 60):02d}:{int(elapsed % 60):02d}"
-    
-    text = (
-        f"📂 **{job.source_name}** → **{job.dest_name}**\n\n"
-        f"📌 **Topic:** {topic_name}\n"
-        f"📊 `{bar}`  `{pct:.1f}%`\n"
-        f"✅ `{done}` / `{total}` messages\n"
-    )
-    if speed > 0:
-        text += f"⚡ `~{speed:.1f} msgs/sec`\n"
-    if eta > 0:
-        eta_str = f"{int(eta // 60):02d}:{int(eta % 60):02d}"
-        text += f"⏳ ETA: `{eta_str}`\n"
-    
-    total_done = job.cloned_messages + done
-    total_all = job.total_messages
-    text += f"\n📊 **Overall:** `{total_done}` / `{total_all}` messages\n"
-    text += f"⏰ **Elapsed:** `{elapsed_str}`"
-    
-    return text
+    avg     = done / elapsed if elapsed > 0 else 0
+    eta     = (total - done) / avg if avg > 0 else 0
+    lines = [
+        f"📂 **{job.src_name}** ➠ **{job.dst_name}**",
+        f"📌 Topic: `{topic}`",
+        f"[`{pbar(done,total)}`] `{pct:.1f}%`",
+        f"✅ `{done}` / `{total}`",
+    ]
+    if avg > 0:
+        lines.append(f"⚡ `{avg:.1f} msg/s`  ⏳ ETA `{elapsed_str(eta)}`")
+    overall = job.cloned_messages + done
+    lines += [
+        f"\n📊 Overall: `{overall}` / `{job.total_messages}`",
+        f"⏰ Elapsed: `{elapsed_str(elapsed)}`",
+    ]
+    if job.failed_messages:
+        lines.append(f"⚠️ Failed: `{job.failed_messages}`")
+    return "\n".join(lines)
 
-
-async def resolve_chat(client: Client, identifier: str) -> Optional[Chat]:
-    """Resolve a chat from various identifier formats."""
-    ident = identifier.strip()
-    
-    # Try invite link
-    if "t.me/" in ident or "tg://" in ident:
-        try:
-            m = re.search(r"(?:joinchat/|\+)([\w\-_]+)", ident)
-            if m:
-                return await client.join_chat(m.group(1))
-            m = re.search(r"t\.me/([\w_]+)", ident)
-            if m:
-                return await client.get_chat(m.group(1))
-        except Exception as e:
-            logger.warning(f"Invite link failed: {e}")
-            return None
-    
-    # Try numeric ID
+async def safe_edit(msg: Message, text: str):
     try:
-        nid = int(ident)
-        return await client.get_chat(nid)
+        await msg.edit_text(text)
+    except Exception:
+        pass
+
+# ══════════════════════════════════════════════════════════════════
+#  CHAT RESOLUTION
+# ══════════════════════════════════════════════════════════════════
+async def resolve_chat(identifier: str) -> Optional[Chat]:
+    ident = identifier.strip()
+    m = re.search(r"(?:joinchat/|\+)([\w\-]+)", ident)
+    if m:
+        try:
+            return await user.join_chat(m.group(1))
+        except Exception:
+            try:
+                return await user.get_chat(m.group(1))
+            except Exception:
+                return None
+    m = re.search(r"t\.me/([\w_]+)", ident)
+    if m:
+        ident = m.group(1)
+    try:
+        return await user.get_chat(int(ident))
     except ValueError:
         pass
-    
-    # Try username
-    uname = ident.lstrip("@")
     try:
-        return await client.get_chat(uname)
-    except Exception as e:
-        logger.warning(f"Could not resolve '{ident}': {e}")
+        return await user.get_chat(ident.lstrip("@"))
+    except Exception:
         return None
 
-
-async def get_chat_info(client: Client, chat_id: Union[int, str]) -> Dict:
-    """Get detailed chat info including topics."""
-    info = {"name": "Unknown", "id": 0, "type": "Normal", "topics": [], "topics_count": 0, "members": 0}
-    try:
-        chat = await client.get_chat(chat_id)
-        info["name"] = chat.title or "Unknown"
-        info["id"] = chat.id
-        info["members"] = chat.members_count or 0
-        
-        if chat.is_forum:
-            info["type"] = "Forum"
-        else:
-            # Check if topics enabled (topic group without full forum mode)
-            try:
-                topics = await get_forum_topics(client, chat.id)
-                if topics:
-                    info["type"] = "Topic Group"
-                    info["topics"] = topics
-                    info["topics_count"] = len(topics)
-            except Exception:
-                info["type"] = "Normal"
-        
-        # If forum, fetch topics
-        if info["type"] == "Forum":
-            topics = await get_forum_topics(client, chat.id)
-            info["topics"] = topics
-            info["topics_count"] = len(topics)
-            
-    except Exception as e:
-        logger.error(f"Error getting chat info: {e}")
-    
-    return info
-
-
-async def get_forum_topics(client: Client, chat_id: Union[int, str]) -> List[Dict]:
-    """Get all forum topics from a chat."""
+# ══════════════════════════════════════════════════════════════════
+#  FORUM TOPIC HELPERS
+# ══════════════════════════════════════════════════════════════════
+async def get_forum_topics(chat_id: int) -> List[TopicMeta]:
     topics = []
     try:
-        # Use raw API to get forum topics
-        peer = await client.resolve_peer(chat_id)
-        offset_id = 0
-        offset_topic = 0
-        
+        peer = await user.resolve_peer(chat_id)
+        offset_id = offset_topic = 0
         while True:
-            r = await client.invoke(
-                GetForumTopics(
-                    peer=peer,
-                    offset_id=offset_id,
-                    offset_date=0,
-                    offset_topic=offset_topic,
-                    limit=100,
-                )
-            )
+            r = await user.invoke(GetForumTopics(
+                peer=peer, q="",
+                offset_date=0, offset_id=offset_id,
+                offset_topic=offset_topic, limit=100,
+            ))
             if not r.topics:
                 break
-            
             for t in r.topics:
                 if isinstance(t, raw_types.ForumTopic):
-                    topics.append({
-                        "id": t.id,
-                        "title": t.title,
-                        "icon_color": getattr(t, "icon_color", 0),
-                        "icon_emoji_id": getattr(t, "icon_emoji_id", 0),
-                    })
-            
+                    topics.append(TopicMeta(
+                        id=t.id, title=t.title,
+                        icon_color=getattr(t, "icon_color", 0),
+                        icon_emoji_id=getattr(t, "icon_emoji_id", 0),
+                    ))
             if len(r.topics) < 100:
                 break
-            
             last = r.topics[-1]
-            offset_id = last.id
-            offset_topic = last.id
+            offset_id = offset_topic = last.id
     except Exception as e:
-        logger.warning(f"Could not fetch topics: {e}")
-    
+        log.warning(f"get_forum_topics: {e}")
     return topics
 
-
-async def create_topic(client: Client, chat_id: Union[int, str], title: str) -> Optional[int]:
-    """Create a forum topic and return its ID."""
+async def create_topic(chat_id: int, title: str, icon_color: int = 0x6FB9F0) -> Optional[int]:
     try:
-        peer = await client.resolve_peer(chat_id)
-        r = await client.invoke(
-            CreateForumTopic(
-                channel=peer,
-                title=title,
-                icon_color=0x6FB9F0,
-                icon_emoji_id=0,
-                random_id=client.rnd_id(),
-            )
-        )
-        # Extract topic ID from updates
-        for update in r.updates:
-            if isinstance(update, raw_types.UpdateNewMessage) or isinstance(update, raw_types.UpdateNewChannelMessage):
-                if hasattr(update, "message") and hasattr(update.message, "id"):
-                    return update.message.id
-            if isinstance(update, raw_types.UpdateMessageID):
-                return update.id
+        peer = await user.resolve_peer(chat_id)
+        r = await user.invoke(CreateForumTopic(
+            channel=peer, title=title,
+            icon_color=icon_color, random_id=user.rnd_id(),
+        ))
+        for upd in r.updates:
+            if hasattr(upd, "message") and hasattr(upd.message, "id"):
+                return upd.message.id
+            if isinstance(upd, raw_types.UpdateMessageID):
+                return upd.id
     except Exception as e:
-        logger.error(f"Failed to create topic '{title}': {e}")
+        log.error(f"create_topic '{title}': {e}")
     return None
 
+async def find_or_create_topic(chat_id: int, title: str, existing: List[TopicMeta]) -> Optional[int]:
+    for t in existing:
+        if t.title.strip().lower() == title.strip().lower():
+            return t.id
+    new_id = await create_topic(chat_id, title)
+    if new_id:
+        existing.append(TopicMeta(id=new_id, title=title))
+    return new_id
 
-async def find_or_create_topic(client: Client, chat_id: Union[int, str], title: str, existing_topics: List[Dict]) -> Optional[int]:
-    """Find existing topic or create new one."""
-    # Check existing
-    for t in existing_topics:
-        if t["title"].strip().lower() == title.strip().lower():
-            return t["id"]
-    
-    # Create new
-    return await create_topic(client, chat_id, title)
+# ══════════════════════════════════════════════════════════════════
+#  CHAT INFO
+# ══════════════════════════════════════════════════════════════════
+async def get_chat_info(chat_id: int) -> Dict:
+    info = {"name": "Unknown", "id": chat_id, "type": "Normal",
+            "topics": [], "topics_count": 0, "members": 0}
+    try:
+        chat = await user.get_chat(chat_id)
+        info["name"]    = chat.title or getattr(chat, "first_name", "") or "Unknown"
+        info["id"]      = chat.id
+        info["members"] = chat.members_count or 0
+        if getattr(chat, "is_forum", False):
+            info["type"] = "Forum"
+            topics = await get_forum_topics(chat.id)
+            info["topics"]       = [{"id": t.id, "title": t.title,
+                                      "icon_color": t.icon_color} for t in topics]
+            info["topics_count"] = len(topics)
+        elif chat.type == enums.ChatType.CHANNEL:
+            info["type"] = "Channel"
+    except Exception as e:
+        log.error(f"get_chat_info: {e}")
+    return info
 
-
-async def get_messages_sorted(client: Client, chat_id: Union[int, str], topic_id: Optional[int] = None, min_id: int = 0) -> List[Message]:
-    """Get all messages in ascending order."""
-    messages = []
+# ══════════════════════════════════════════════════════════════════
+#  MESSAGE FETCHING  — ascending order
+# ══════════════════════════════════════════════════════════════════
+async def fetch_messages_asc(chat_id: int,
+                              topic_id: Optional[int] = None,
+                              min_id: int = 0) -> List[Message]:
+    collected = []
     offset_id = 0
-    
-    try:
-        while True:
-            kwargs = dict(
-                chat_id=chat_id,
-                limit=100,
-                offset_id=offset_id if offset_id else 0,
-            )
-            if topic_id:
-                # For topics, we use topic_id parameter
-                # Pyrogram's get_messages with topic_id only works in some versions
-                # We'll use raw history instead
-                pass
-            
-            chunk = await client.get_messages(
-                chat_id=chat_id,
-                limit=100,
-                offset_id=offset_id if offset_id else 0,
-                reply_to_message_id=None,
-            )
-            
-            if not chunk:
-                break
-            
-            for m in chunk:
-                if m.id > min_id:
-                    messages.append(m)
-            
-            if len(chunk) < 100:
-                break
-            
-            offset_id = chunk[-1].id
-    
-    except Exception as e:
-        logger.error(f"Error fetching messages: {e}")
-    
-    # Sort ascending
-    messages.sort(key=lambda m: m.id)
-    return messages
-
-
-async def get_topic_messages_sorted(client: Client, chat_id: Union[int, str], topic_id: int, min_id: int = 0) -> List[Message]:
-    """Get messages from a specific topic using raw API."""
-    from pyrogram.raw.functions.messages import GetHistory as RawGetHistory
-    messages = []
-
-    try:
-        peer = await client.resolve_peer(chat_id)
-        offset_id = 0
-
-        while True:
-            r = await client.invoke(
-                RawGetHistory(
-                    peer=peer,
-                    offset_id=offset_id,
-                    offset_date=0,
-                    add_offset=0,
-                    limit=100,
-                    max_id=0,
-                    min_id=min_id,
-                    hash=0,
-                )
-            )
-
-            if not r.messages:
-                break
-
-            ids = [m.id for m in r.messages if hasattr(m, "id") and m.id > min_id]
-            if not ids:
-                break
-
-            # Filter to only messages belonging to this topic (reply_to.reply_to_top_id or reply_to.reply_to_msg_id == topic_id)
-            chunk = await client.get_messages(chat_id, ids)
-            for m in chunk:
-                if not m or not m.id:
-                    continue
-                # Check if message belongs to the topic
-                if m.topic:
-                    # pyrogram sets m.topic on forum topic messages
-                    pass
-                reply = getattr(m, "reply_to_message_id", None) or getattr(m, "reply_to_top_message_id", None)
-                # Include message if it's in this topic
-                # In forums, topic_id == the thread root message id
-                raw_msg = next((x for x in r.messages if getattr(x, "id", None) == m.id), None)
-                if raw_msg:
-                    reply_to = getattr(raw_msg, "reply_to", None)
-                    if reply_to:
-                        top = getattr(reply_to, "reply_to_top_id", None) or getattr(reply_to, "reply_to_msg_id", None)
-                        if top == topic_id or m.id == topic_id:
-                            messages.append(m)
-                    else:
-                        # No reply_to means it could be the root topic message itself
-                        if m.id == topic_id:
-                            messages.append(m)
-
-            if len(r.messages) < 100:
-                break
-
-            offset_id = r.messages[-1].id
-
-    except Exception as e:
-        logger.error(f"Error fetching topic messages (raw): {e}")
-
-    # Fallback: if raw approach got nothing, fetch all and filter by topic
-    if not messages:
+    while True:
         try:
-            offset_id = 0
-            while True:
-                chunk = await client.get_messages(
-                    chat_id,
-                    limit=100,
-                    offset_id=offset_id if offset_id else 0,
-                )
-                if not chunk:
-                    break
-                for m in chunk:
-                    if not m or not m.id:
-                        continue
-                    if m.id <= min_id:
-                        continue
-                    # Check topic membership via reply_to
-                    if hasattr(m, "reply_to_message_id") and m.reply_to_message_id == topic_id:
-                        messages.append(m)
-                    elif m.id == topic_id:
-                        messages.append(m)
-                if len(chunk) < 100:
-                    break
-                offset_id = chunk[-1].id
+            chunk = await user.get_messages(chat_id, limit=200, offset_id=offset_id)
+        except FloodWait as e:
+            await asyncio.sleep(e.value + 2)
+            continue
         except Exception as e:
-            logger.error(f"Error in fallback topic fetch: {e}")
-
-    messages.sort(key=lambda m: m.id)
-    return messages
-
-
-# ====== CORE CLONE FUNCTION ======
-
-async def clone_topic(
-    user_client: Client,
-    source_id: int,
-    dest_id: int,
-    topic_info: Optional[Dict],
-    job: CloneJob,
-    status_msg: Message,
-    dest_topics: List[Dict],
-) -> Tuple[int, int]:
-    """Clone a single topic using Pyrogram's copy_message()."""
-    topic_name = topic_info["title"] if topic_info else "General"
-    src_topic_id = topic_info["id"] if topic_info else None
-    
-    # Get destination topic ID (for topic groups / forums)
-    dest_topic_id = None
-    dest_is_topic = job.dest_type in ("Topic Group", "Forum")
-    if dest_is_topic and topic_info:
-        dest_topic_id = await find_or_create_topic(user_client, dest_id, topic_name, dest_topics)
-        if dest_topic_id:
-            dest_topics.append({"id": dest_topic_id, "title": topic_name})
-            job.save()
-    
-    # Get last cloned message ID
-    last_id = job.last_msg_id.get(topic_name, 0)
-    
-    # Fetch messages
-    await status_msg.edit_text(f"🔄 **{topic_name}**: Fetching messages...")
-    
-    if src_topic_id:
-        messages = await get_topic_messages_sorted(user_client, source_id, src_topic_id, last_id)
-    else:
-        messages = await get_messages_sorted(user_client, source_id, None, last_id)
-    
-    if not messages:
-        return 0, 0
-    
-    total = len(messages)
-    done = 0
-    start = time.time()
-    speeds = []
-    
-    # Group handling: track grouped_id -> all messages in that group
-    grouped: Dict[int, List[Message]] = {}
-    standalone: List[Message] = []
-    
-    # First pass: separate grouped and standalone messages
-    # Actually, we process in order and handle albums via copy_media_group
-    # But for simplicity and reliability, we copy each message individually
-    # Pyrogram's copy_message handles everything including media
-    
-    for msg in messages:
-        if cancel_event.is_set():
+            log.error(f"fetch_messages_asc: {e}")
             break
-        
-        # Skip service messages
+        if not chunk:
+            break
+        for msg in chunk:
+            if not msg or not msg.id:
+                continue
+            if msg.id <= min_id:
+                continue
+            if topic_id is not None:
+                rtt = getattr(msg, "reply_to_top_message_id", None)
+                rtm = getattr(msg, "reply_to_message_id", None)
+                is_root   = (msg.id == topic_id)
+                in_thread = (rtt == topic_id) or (rtm == topic_id and rtt is None)
+                if not (is_root or in_thread):
+                    continue
+            collected.append(msg)
+        if len(chunk) < 200:
+            break
+        offset_id = chunk[-1].id
+    collected.sort(key=lambda m: m.id)
+    return collected
+
+# ══════════════════════════════════════════════════════════════════
+#  CLONE ENGINE
+# ══════════════════════════════════════════════════════════════════
+async def clone_section(
+    job: CloneJob, status_msg: Message, uid_key: str,
+    src_id: int, dst_id: int,
+    topic_info: Optional[Dict],
+    dst_topic_id: Optional[int],
+) -> Tuple[int, int]:
+
+    topic_name   = topic_info["title"] if topic_info else "General"
+    src_topic_id = topic_info["id"]    if topic_info else None
+    last_id      = job.last_msg_id.get(topic_name, 0)
+
+    await safe_edit(status_msg, f"📥 Fetching `{topic_name}`…")
+    messages = await fetch_messages_asc(src_id, src_topic_id, last_id)
+
+    if not messages:
+        job.completed_topics.add(topic_name)
+        job.save()
+        return 0, 0
+
+    total = len(messages)
+    done  = 0
+    t0    = time.time()
+
+    for msg in messages:
+        if cancel_flags.get(uid_key):
+            break
         if msg.service:
             done += 1
             job.last_msg_id[topic_name] = msg.id
             continue
-        
-        retries = 3
+
+        # build copy kwargs
+        copy_kwargs = {"chat_id": dst_id, "disable_notification": True}
+        src_reply   = getattr(msg, "reply_to_message_id", None)
+        if dst_topic_id and not src_reply:
+            copy_kwargs["reply_to_message_id"] = dst_topic_id
+        elif src_reply:
+            copy_kwargs["reply_to_message_id"] = src_reply
+
+        retries = 4
+        success = False
         while retries > 0:
             try:
-                # THE KEY TECHNIQUE: use Pyrogram's copy_message
-                # This sends InputMediaDocument/InputMediaPhoto with file reference
-                # Telegram copies the file server-side — zero download
-                
-                # Determine reply to
-                reply_id = None
-                if msg.reply_to_message_id:
-                    reply_id = msg.reply_to_message_id
-                
-                copy_kwargs = dict(
-                    chat_id=dest_id,
-                    disable_notification=True,
-                )
-                if reply_id:
-                    copy_kwargs["reply_to_message_id"] = reply_id
-                # message_thread_id not in pyrogram 2.0.106, use reply_to_message_id for topic root
-                if dest_topic_id and not reply_id:
-                    copy_kwargs["reply_to_message_id"] = dest_topic_id
                 await msg.copy(**copy_kwargs)
-                
-                done += 1
-                job.cloned_messages += 1
-                job.last_msg_id[topic_name] = msg.id
-                
-                # Update speed
-                elapsed = time.time() - start
-                speeds.append(elapsed / done if done > 0 else 0)
+                success = True
                 break
-                
             except FloodWait as e:
-                wait = e.value
-                logger.warning(f"Flood wait {wait}s")
-                await status_msg.edit_text(f"⏳ Flood wait `{wait}s`...")
+                wait = max(e.value, 5)
+                await safe_edit(status_msg,
+                    f"⏳ FloodWait `{wait}s`…  Topic: `{topic_name}` `{done}/{total}`")
                 await asyncio.sleep(wait)
-                retries -= 1
-                
             except (FileReferenceExpired, FileReferenceInvalid):
-                if retries > 0:
-                    # Refresh file reference by re-fetching message
-                    try:
-                        fresh = await user_client.get_messages(source_id, msg.id)
-                        if fresh:
-                            msg = fresh
-                    except Exception:
-                        pass
-                    await asyncio.sleep(0.5)
-                    retries -= 1
-                else:
-                    logger.warning(f"File ref expired for msg {msg.id}, skipping")
-                    done += 1
-                    break
-                    
+                retries -= 1
+                try:
+                    fresh = await user.get_messages(src_id, msg.id)
+                    if fresh and fresh.id:
+                        msg = fresh
+                except Exception:
+                    pass
+                await asyncio.sleep(1)
             except RPCError as e:
-                logger.warning(f"RPCError on msg {msg.id}: {e}")
-                done += 1
+                log.warning(f"RPCError msg {msg.id}: {e}")
                 break
-                
             except Exception as e:
-                logger.error(f"Error on msg {msg.id}: {e}")
-                done += 1
+                log.error(f"Error msg {msg.id}: {e}")
                 break
-        
-        # Save progress every 5 messages
-        if done % 5 == 0:
+
+        if not success:
+            job.failed_messages += 1
+        else:
+            job.cloned_messages += 1
+
+        done += 1
+        job.last_msg_id[topic_name] = msg.id
+
+        if done % 10 == 0:
             job.save()
-        
-        # Update status every message
-        if done % 3 == 0 or done == total:
-            pct = (done / total) * 100
-            now = time.time()
-            avg_speed = done / (now - start) if (now - start) > 0 else 0
-            eta_remaining = (total - done) / avg_speed if avg_speed > 0 else 0
-            
-            try:
-                text = get_progress_text(job, topic_name, done, total, avg_speed, eta_remaining)
-                await status_msg.edit_text(text)
-            except Exception:
-                pass
-        
-        await asyncio.sleep(0.1)  # Rate limiting
-    
-    # Mark topic complete
+        if done % 5 == 0 or done == total:
+            await safe_edit(status_msg, progress_text(job, topic_name, done, total))
+
+        await asyncio.sleep(0.08)
+
     job.completed_topics.add(topic_name)
     job.save()
-    
     return done, total
 
+# ══════════════════════════════════════════════════════════════════
+#  ORCHESTRATOR
+# ══════════════════════════════════════════════════════════════════
+async def run_clone(uid_key: str, status_msg: Message,
+                    src_info: Dict, dst_info: Dict,
+                    resume_job: Optional[CloneJob] = None):
 
-# ====== BOT COMMANDS ======
+    src_id = src_info["id"]
+    dst_id = dst_info["id"]
 
-
-async def start_cmd(client: Client, message: Message):
-    text = (
-        "🤖 **Telegram Topic Cloner Bot v4.0**\n\n"
-        "Clones entire forums/topic groups while preserving:\n"
-        "✅ All topics with exact names\n"
-        "✅ Message order (oldest first)\n"
-        "✅ Media (photos, videos, docs, audio)\n"
-        "✅ Reply chains\n"
-        "✅ Albums\n"
-        "✅ Server-side copy — no download\n\n"
-        "**Commands:**\n"
-        "/clone — Start a new clone job\n"
-        "/status — Check active clone progress\n"
-        "/cancel — Cancel active clone\n"
-        "/help — Detailed help"
+    job = resume_job or CloneJob(
+        src_id=src_id, dst_id=dst_id,
+        src_name=src_info["name"], dst_name=dst_info["name"],
+        src_type=src_info["type"], dst_type=dst_info["type"],
+        topics=src_info["topics"], start_time=time.time(),
     )
-    await message.reply_text(text)
+    job.start_time        = time.time()
+    active_jobs[uid_key]  = job
+    cancel_flags[uid_key] = False
 
-
-async def help_cmd(client: Client, message: Message):
-    text = (
-        "📖 **How to use:**\n\n"
-        "1️⃣ Send `/clone` to start\n"
-        "2️⃣ Enter **Source Group** ID/username/link\n"
-        "3️⃣ Enter **Destination Group** ID/username/link\n"
-        "4️⃣ Choose resume option if progress exists\n"
-        "5️⃣ Bot clones everything automatically\n\n"
-        "**Supports:**\n"
-        "• Forums (full topic mode)\n"
-        "• Topic Groups\n"
-        "• Normal Groups\n"
-        "• Any media type (no size limit)\n"
-        "• Forward-restricted chats\n"
-        "• Albums (grouped media)\n"
-        "• Reply chains\n\n"
-        "**Tech:** Uses Pyrogram `copy_message()` — server-side transfer.\n"
-        "Files stay on Telegram servers. Zero disk usage."
-    )
-    await message.reply_text(text)
-
-
-async def cancel_cmd(client: Client, message: Message):
-    uid = message.from_user.id if message.from_user else message.sender_chat.id
-    key = str(uid)
-    
-    if key in active_jobs:
-        cancel_event.set()
-        await message.reply_text("⏹️ **Cancelling...** Progress saved. You can resume later.")
-    else:
-        await message.reply_text("❌ No active clone job.")
-
-
-async def status_cmd(client: Client, message: Message):
-    uid = message.from_user.id if message.from_user else message.sender_chat.id
-    key = str(uid)
-    
-    if key in active_jobs:
-        job = active_jobs[key]
-        elapsed = time.time() - job.start_time
-        elapsed_str = f"{int(elapsed // 60):02d}:{int(elapsed % 60):02d}"
-        
-        text = (
-            f"📊 **Clone Status**\n\n"
-            f"📂 `{job.source_name}` → `{job.dest_name}`\n"
-            f"✅ Cloned: `{job.cloned_messages}` / `{job.total_messages}`\n"
-            f"📌 Topics: `{len(job.completed_topics)}` / `{len(job.topics) if job.topics else 1}`\n"
-            f"⏰ Elapsed: `{elapsed_str}`\n"
-            f"📈 Status: **Running**"
-        )
-        await message.reply_text(text)
-    else:
-        # Check for saved progress
-        await message.reply_text("❌ No active clone. Use `/clone` to start one.")
-
-
-async def clone_cmd(client: Client, message: Message):
-    uid = message.from_user.id if message.from_user else message.sender_chat.id
-    
-    # Check if already running
-    key = str(uid)
-    if key in active_jobs:
-        await message.reply_text("⚠️ A clone is already running! Use `/cancel` first or wait.")
-        return
-    
-    # Check force sub
-    if FORCESUB_CHANNEL:
-        try:
-            member = await client.get_chat_member(FORCESUB_CHANNEL, uid)
-            if member.status == "kicked":
-                await message.reply_text("❌ You are banned.")
-                return
-        except Exception:
-            chat = await client.get_chat(FORCESUB_CHANNEL)
-            invite_link = chat.invite_link or (await client.export_chat_invite_link(FORCESUB_CHANNEL))
-            await message.reply_text(
-                f"❌ You must join {chat.title} first!",
-                reply_markup=InlineKeyboardMarkup([[
-                    InlineKeyboardButton("Join Channel", url=invite_link)
-                ]])
-            )
-            return
-    
-    # Start interactive setup
-    await message.reply_text(
-        "🔄 **Clone Setup Started**\n\n"
-        "Send me the **Source Chat** (where to copy FROM):\n"
-        "• Numeric ID (e.g., `-1001234567890`)\n"
-        "• Username (e.g., `@mygroup`)\n"
-        "• Invite link (e.g., `https://t.me/+abc123`)"
-    )
-    
-    # We use a simple state machine with conversation
-    # Store state in a dict
-    states: Dict[int, str] = {}
-    data: Dict[int, Dict] = {}
-    
-    states[uid] = "awaiting_source"
-    data[uid] = {}
-    
-    # Wait for source
-    while True:
-        msg = await client.listen(chat_id=uid, timeout=300)
-        if not msg:
-            await message.reply_text("⏰ Timed out. Send `/clone` again.")
-            return
-        if msg.text and msg.text.startswith("/"):
-            await message.reply_text("❌ Command cancelled.")
-            return
-        
-        if states[uid] == "awaiting_source":
-            source_ident = msg.text.strip()
-            status = await msg.reply_text("🔍 Resolving source chat...")
-            
-            source_chat = await resolve_chat(user, source_ident)
-            if not source_chat:
-                await status.edit_text("❌ Could not find that source. Try again with a valid ID, @username, or invite link.")
-                continue
-            
-            source_info = await get_chat_info(user, source_chat.id)
-            data[uid]["source"] = source_info
-            states[uid] = "awaiting_dest"
-            
-            await status.edit_text(
-                f"✅ **Source:** `{source_info['name']}`\n"
-                f"   Type: `{source_info['type']}` | Topics: `{source_info['topics_count']}`\n\n"
-                f"Now send me the **Destination Chat** (where to copy TO):"
-            )
-            
-        elif states[uid] == "awaiting_dest":
-            dest_ident = msg.text.strip()
-            status = await msg.reply_text("🔍 Resolving destination chat...")
-            
-            dest_chat = await resolve_chat(user, dest_ident)
-            if not dest_chat:
-                await status.edit_text("❌ Could not find that destination. Try again.")
-                continue
-            
-            dest_info = await get_chat_info(user, dest_chat.id)
-            data[uid]["dest"] = dest_info
-            states[uid] = "awaiting_resume"
-            
-            # Check for existing progress
-            job = CloneJob.load(source_info["id"], dest_info["id"])
-            
-            if job:
-                await status.edit_text(
-                    f"✅ **Destination:** `{dest_info['name']}`\n"
-                    f"   Type: `{dest_info['type']}` | Topics: `{dest_info['topics_count']}`\n\n"
-                    f"📂 **Previous progress found!**\n"
-                    f"   Cloned: `{job.cloned_messages}` / `{job.total_messages}` messages\n"
-                    f"   Topics: `{len(job.completed_topics)}` / `{len(job.topics) if job.topics else 1}`\n\n"
-                    f"Resume? Send `yes` or `no`:"
-                )
-            else:
-                # No previous progress, start fresh
-                await start_clone(user, msg, source_info, dest_info, None)
-                return
-        
-        elif states[uid] == "awaiting_resume":
-            answer = msg.text.strip().lower()
-            if answer in ("yes", "y"):
-                job = CloneJob.load(data[uid]["source"]["id"], data[uid]["dest"]["id"])
-                await msg.reply_text("▶️ **Resuming clone...**")
-                await start_clone(user, msg, data[uid]["source"], data[uid]["dest"], job)
-            else:
-                # Delete old progress
-                old_job = CloneJob.load(data[uid]["source"]["id"], data[uid]["dest"]["id"])
-                if old_job:
-                    old_job.delete()
-                await msg.reply_text("🔄 **Starting fresh clone...**")
-                await start_clone(user, msg, data[uid]["source"], data[uid]["dest"], None)
-            return
-
-
-async def start_clone(
-    user_client: Client,
-    msg: Message,
-    source_info: Dict,
-    dest_info: Dict,
-    existing_job: Optional[CloneJob],
-):
-    """Execute the clone operation."""
-    uid = msg.from_user.id if msg.from_user else msg.sender_chat.id
-    key = str(uid)
-    
-    source_id = source_info["id"]
-    dest_id = dest_info["id"]
-    
-    # Create or load job
-    if existing_job:
-        job = existing_job
-    else:
-        job = CloneJob(
-            source_id=source_id,
-            dest_id=dest_id,
-            source_name=source_info["name"],
-            dest_name=dest_info["name"],
-            source_type=source_info["type"],
-            dest_type=dest_info["type"],
-            topics=source_info["topics"],
-            start_time=time.time(),
-        )
-    
-    # Count total messages
-    status_msg = await msg.reply_text("🔢 **Counting messages...**")
-    total = 0
     topics_to_clone = job.topics if job.topics else [{"id": None, "title": "General"}]
-    
+
+    # pre-count
+    await safe_edit(status_msg, "🔢 Counting messages…")
+    total_count = 0
     for t in topics_to_clone:
-        tname = t["title"]
-        if tname in job.completed_topics:
+        if t["title"] in job.completed_topics:
             continue
-        last_id = job.last_msg_id.get(tname, 0)
         try:
-            if t["id"]:
-                msgs = await get_topic_messages_sorted(user_client, source_id, t["id"], last_id)
-            else:
-                msgs = await get_messages_sorted(user_client, source_id, None, last_id)
-            total += len(msgs)
+            msgs = await fetch_messages_asc(
+                src_id, t.get("id"),
+                job.last_msg_id.get(t["title"], 0)
+            )
+            total_count += len(msgs)
         except Exception:
             pass
-    
-    job.total_messages = total
+    job.total_messages = total_count
     job.save()
-    
-    if total == 0:
-        # Check if it's just completed topics
-        if len(job.completed_topics) == len(topics_to_clone):
-            await status_msg.edit_text("✅ **All topics already cloned!** Nothing to do.")
-        else:
-            await status_msg.edit_text("ℹ️ No new messages found to clone.")
+
+    if total_count == 0:
+        await safe_edit(status_msg, "ℹ️ Nothing new to clone.")
+        active_jobs.pop(uid_key, None)
         return
-    
-    active_jobs[key] = job
-    
-    # Get existing destination topics (to avoid re-creating)
-    dest_topics = await get_forum_topics(user_client, dest_id) if dest_info["type"] in ("Topic Group", "Forum") else []
-    
-    # Clone each topic
+
+    # destination topics cache
+    dst_existing: List[TopicMeta] = []
+    if dst_info["type"] == "Forum":
+        dst_existing = await get_forum_topics(dst_id)
+
+    n = len(topics_to_clone)
     for idx, t in enumerate(topics_to_clone, 1):
-        if cancel_event.is_set():
-            cancel_event.clear()
+        if cancel_flags.get(uid_key):
             break
-        
-        tname = t["title"]
-        if tname in job.completed_topics:
+        if t["title"] in job.completed_topics:
             continue
-        
-        await status_msg.edit_text(f"📌 **[{idx}/{len(topics_to_clone)}] Processing:** `{tname}`")
-        
-        done, total_in_topic = await clone_topic(
-            user_client, source_id, dest_id, t, job, status_msg, dest_topics
+
+        dst_topic_id: Optional[int] = None
+        if dst_info["type"] == "Forum" and t.get("id"):
+            dst_topic_id = await find_or_create_topic(dst_id, t["title"], dst_existing)
+
+        await safe_edit(status_msg,
+            f"📌 **[{idx}/{n}]** `{t['title']}`\n"
+            f"📂 `{src_info['name']}` ➠ `{dst_info['name']}`"
         )
-        
-        if done > 0:
-            await status_msg.edit_text(
-                f"✅ **Completed:** `{tname}`\n"
-                f"   Cloned `{done}` / `{total_in_topic}` messages"
-            )
-            await asyncio.sleep(1)
-    
-    # Finish
+        await clone_section(job, status_msg, uid_key,
+                            src_id, dst_id,
+                            t if t.get("id") else None,
+                            dst_topic_id)
+
+    elapsed    = time.time() - job.start_time
+    cancelled  = cancel_flags.get(uid_key, False)
+    icon       = "⏹️ Cancelled" if cancelled else "✅ Clone Complete!"
+    summary    = (
+        f"{icon}\n\n"
+        f"📂 `{job.src_name}` ➠ `{job.dst_name}`\n"
+        f"✅ Cloned  : `{job.cloned_messages}` msgs\n"
+        f"📌 Topics  : `{len(job.completed_topics)}` / `{n}`\n"
+        f"⏰ Time    : `{elapsed_str(elapsed)}`"
+    )
+    if job.failed_messages:
+        summary += f"\n⚠️ Failed   : `{job.failed_messages}` msgs"
+    if cancelled:
+        summary += "\n\n💾 Progress saved — `/clone` to resume."
+
+    await safe_edit(status_msg, summary)
+    active_jobs.pop(uid_key, None)
+    cancel_flags.pop(uid_key, None)
+    if not cancelled:
+        job.delete()
+
+# ══════════════════════════════════════════════════════════════════
+#  FORCE-SUB
+# ══════════════════════════════════════════════════════════════════
+async def check_force_sub(client: Client, uid: int, msg: Message) -> bool:
+    if not FORCESUB_CHANNEL:
+        return True
+    try:
+        member = await client.get_chat_member(FORCESUB_CHANNEL, uid)
+        if member.status.value in ("banned", "kicked"):
+            await msg.reply_text("❌ You are banned.")
+            return False
+        return True
+    except UserNotParticipant:
+        try:
+            chat = await client.get_chat(FORCESUB_CHANNEL)
+            link = chat.invite_link or await client.export_chat_invite_link(FORCESUB_CHANNEL)
+        except Exception:
+            link = None
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("📢 Join Channel", url=link)]]) if link else None
+        await msg.reply_text("❌ **Join our channel first!**", reply_markup=kb)
+        return False
+    except Exception:
+        return True
+
+# ══════════════════════════════════════════════════════════════════
+#  COMMAND HANDLERS
+# ══════════════════════════════════════════════════════════════════
+START_TEXT = (
+    "👋 **Universal Cloner Bot**\n"
+    "__Dev: Gourav Rajput__\n\n"
+    "Clone any Telegram chat with full topic support.\n\n"
+    "**Commands:**\n"
+    "/clone  — Start a clone job\n"
+    "/status — Check progress\n"
+    "/cancel — Stop & save progress\n"
+    "/help   — Full guide"
+)
+
+HELP_TEXT = (
+    "📖 **How to use:**\n\n"
+    "1️⃣  `/clone`\n"
+    "2️⃣  Send **Source** chat\n"
+    "3️⃣  Send **Destination** chat\n"
+    "4️⃣  Bot handles everything!\n\n"
+    "**Accepts:**\n"
+    "• `-1001234567890` (numeric ID)\n"
+    "• `@username`\n"
+    "• `https://t.me/+xxxxxx` (invite link)\n\n"
+    "**Works with:**\n"
+    "✅ Normal groups\n"
+    "✅ Forum topic groups\n"
+    "✅ Channels\n"
+    "✅ Forward-restricted chats\n"
+    "✅ Albums & media\n"
+    "✅ Reply chains\n"
+    "✅ Resume after cancel\n\n"
+    "**Requirements:**\n"
+    "• User account = member of source\n"
+    "• User account = admin in destination\n\n"
+    "__Dev: Gourav Rajput__"
+)
+
+async def cmd_start(client: Client, msg: Message):
+    if not await check_force_sub(client, msg.from_user.id, msg):
+        return
+    await msg.reply_text(START_TEXT, reply_markup=InlineKeyboardMarkup([[
+        InlineKeyboardButton("📖 Help", callback_data="cb_help"),
+    ]]))
+
+async def cmd_help(client: Client, msg: Message):
+    await msg.reply_text(HELP_TEXT)
+
+async def cmd_status(client: Client, msg: Message):
+    k = str(msg.from_user.id)
+    job = active_jobs.get(k)
+    if not job:
+        await msg.reply_text("❌ No active job. Use `/clone` to start.")
+        return
     elapsed = time.time() - job.start_time
-    elapsed_str = f"{int(elapsed // 60):02d}:{int(elapsed % 60):02d}"
-    
-    await status_msg.edit_text(
-        f"✅ **Clone Complete!**\n\n"
-        f"📂 `{job.source_name}` → `{job.dest_name}`\n"
-        f"📊 Cloned: `{job.cloned_messages}` / `{job.total_messages}`\n"
-        f"📌 Topics: `{len(job.completed_topics)}` / `{len(topics_to_clone)}`\n"
-        f"⏰ Time: `{elapsed_str}`"
+    await msg.reply_text(
+        f"📊 **Clone Running**\n\n"
+        f"📂 `{job.src_name}` ➠ `{job.dst_name}`\n"
+        f"✅ `{job.cloned_messages}` / `{job.total_messages}` msgs\n"
+        f"📌 Topics done: `{len(job.completed_topics)}`\n"
+        f"⏰ `{elapsed_str(elapsed)}`"
     )
-    
-    # Cleanup
-    active_jobs.pop(key, None)
-    job.save()
 
+async def cmd_cancel(client: Client, msg: Message):
+    k = str(msg.from_user.id)
+    if k not in active_jobs:
+        await msg.reply_text("❌ No active clone job.")
+        return
+    cancel_flags[k] = True
+    await msg.reply_text("⏹️ **Cancelling…** progress will be saved.")
 
-# ====== MAIN ======
+async def cmd_clone(client: Client, msg: Message):
+    uid = msg.from_user.id
+    k   = str(uid)
 
+    if not await check_force_sub(client, uid, msg):
+        return
+    if k in active_jobs:
+        await msg.reply_text("⚠️ Already running! `/cancel` first.")
+        return
+
+    # ── source ────────────────────────────────────────────────────
+    await msg.reply_text(
+        "📤 **Send Source Chat**\n\n"
+        "Accepted: numeric ID / @username / invite link\n"
+        "_Timeout: 5 min_"
+    )
+    try:
+        src_msg = await client.listen(uid, timeout=300)
+    except asyncio.TimeoutError:
+        await msg.reply_text("⏰ Timeout. Send `/clone` again.")
+        return
+    if src_msg.text and src_msg.text.startswith("/"):
+        await msg.reply_text("❌ Cancelled.")
+        return
+
+    resolving = await src_msg.reply_text("🔍 Resolving source…")
+    src_chat  = await resolve_chat(src_msg.text.strip())
+    if not src_chat:
+        await resolving.edit_text("❌ Source not found. Check ID / username / link.")
+        return
+
+    src_info = await get_chat_info(src_chat.id)
+    await resolving.edit_text(
+        f"✅ **Source:** `{src_info['name']}`\n"
+        f"   Type: `{src_info['type']}` | Topics: `{src_info['topics_count']}`\n\n"
+        f"📥 **Now send Destination Chat:**"
+    )
+
+    # ── destination ───────────────────────────────────────────────
+    try:
+        dst_msg = await client.listen(uid, timeout=300)
+    except asyncio.TimeoutError:
+        await msg.reply_text("⏰ Timeout. Send `/clone` again.")
+        return
+    if dst_msg.text and dst_msg.text.startswith("/"):
+        await msg.reply_text("❌ Cancelled.")
+        return
+
+    dst_status = await dst_msg.reply_text("🔍 Resolving destination…")
+    dst_chat   = await resolve_chat(dst_msg.text.strip())
+    if not dst_chat:
+        await dst_status.edit_text("❌ Destination not found.")
+        return
+
+    dst_info = await get_chat_info(dst_chat.id)
+    await dst_status.edit_text(
+        f"✅ **Destination:** `{dst_info['name']}`\n"
+        f"   Type: `{dst_info['type']}` | Topics: `{dst_info['topics_count']}`"
+    )
+
+    # ── resume? ───────────────────────────────────────────────────
+    saved    = CloneJob.load(src_info["id"], dst_info["id"])
+    resume   = False
+    if saved and saved.cloned_messages > 0:
+        await dst_status.reply_text(
+            f"💾 **Previous progress found!**\n"
+            f"Cloned `{saved.cloned_messages}` / `{saved.total_messages}` msgs\n"
+            f"Topics: `{len(saved.completed_topics)}`\n\n"
+            f"Send `yes` to resume, `no` for fresh start:"
+        )
+        try:
+            ans    = await client.listen(uid, timeout=120)
+            resume = ans.text.strip().lower() in ("yes", "y")
+        except asyncio.TimeoutError:
+            resume = False
+
+    if not resume and saved:
+        saved.delete()
+        saved = None
+
+    # ── start ─────────────────────────────────────────────────────
+    status_msg = await msg.reply_text("🚀 Starting clone…")
+    await run_clone(k, status_msg, src_info, dst_info, saved if resume else None)
+
+# ── callback ──────────────────────────────────────────────────────
+async def on_callback(client: Client, cb: CallbackQuery):
+    await cb.answer()
+    if cb.data == "cb_help":
+        await cb.message.reply_text(HELP_TEXT)
+
+# ══════════════════════════════════════════════════════════════════
+#  MAIN
+# ══════════════════════════════════════════════════════════════════
 async def main():
-    global user, app, cancel_event
-    
-    cancel_event = asyncio.Event()
-    
-    print("🚀 Starting Telegram Topic Cloner Bot v4.0")
-    print("=" * 50)
-    
-    # Initialize user client (Pyrogram string session)
-    user = Client(
-        "user_session",
-        session_string=STRING_SESSION,
-        api_id=API_ID,
-        api_hash=API_HASH,
-        in_memory=True,
-    )
+    global bot, user
+
+    print("=" * 56)
+    print("  Universal Cloner Bot  —  Dev: Gourav Rajput")
+    print("=" * 56)
+
+    user = Client("user_s", session_string=STRING_SESSION,
+                  api_id=API_ID, api_hash=API_HASH, in_memory=True)
     await user.start()
     me = await user.get_me()
-    print(f"✅ User client logged in as: {me.first_name} (@{me.username or 'N/A'})")
-    
-    # Initialize bot client
-    app = Client(
-        "bot_session",
-        bot_token=BOT_TOKEN,
-        api_id=API_ID,
-        api_hash=API_HASH,
-        in_memory=True,
-    )
-    
-    # Register all handlers AFTER app is initialized
-    app.add_handler(__import__('pyrogram.handlers', fromlist=['MessageHandler']).MessageHandler(
-        start_cmd, filters.command("start") & filters.private
-    ))
-    app.add_handler(__import__('pyrogram.handlers', fromlist=['MessageHandler']).MessageHandler(
-        help_cmd, filters.command("help")
-    ))
-    app.add_handler(__import__('pyrogram.handlers', fromlist=['MessageHandler']).MessageHandler(
-        clone_cmd, filters.command("clone") & filters.private
-    ))
-    app.add_handler(__import__('pyrogram.handlers', fromlist=['MessageHandler']).MessageHandler(
-        cancel_cmd, filters.command("cancel") & filters.private
-    ))
-    app.add_handler(__import__('pyrogram.handlers', fromlist=['MessageHandler']).MessageHandler(
-        status_cmd, filters.command("status") & filters.private
-    ))
+    print(f"[User]  {me.first_name}  (@{me.username or 'N/A'})")
 
-    await app.start()
-    bot_me = await app.get_me()
-    print(f"✅ Bot client logged in as: @{bot_me.username}")
-    
-    print(f"\n🤖 Bot is running! Send /clone to start.")
-    print(f"   Press Ctrl+C to stop.\n")
-    
-    # Keep running
+    bot = Client("bot_s", bot_token=BOT_TOKEN,
+                 api_id=API_ID, api_hash=API_HASH, in_memory=True)
+
+    bot.add_handler(MessageHandler(cmd_start,  filters.command("start")  & filters.private))
+    bot.add_handler(MessageHandler(cmd_help,   filters.command("help")   & filters.private))
+    bot.add_handler(MessageHandler(cmd_status, filters.command("status") & filters.private))
+    bot.add_handler(MessageHandler(cmd_cancel, filters.command("cancel") & filters.private))
+    bot.add_handler(MessageHandler(cmd_clone,  filters.command("clone")  & filters.private))
+    bot.add_handler(CallbackQueryHandler(on_callback))
+
+    await bot.start()
+    bme = await bot.get_me()
+    print(f"[Bot ]  @{bme.username}")
+    print("\nBot is LIVE! Send /clone to start.\n")
+
     await asyncio.Event().wait()
-
 
 if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        print("\n👋 Stopped.")
+        print("\nStopped.")
     except Exception as e:
-        logger.exception(f"Fatal error: {e}")
+        log.exception(f"Fatal: {e}")
