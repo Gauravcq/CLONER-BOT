@@ -26,8 +26,12 @@ from dataclasses import dataclass, field
 # ====== TELEGRAM CLIENTS ======
 from pyrogram import Client, filters, enums
 from pyrogram.types import (
-    Message, ChatPrivileges, InlineKeyboardMarkup, InlineKeyboardButton,
-    CallbackQuery, ForumTopic, Chat
+    Message,
+    ChatPrivileges,
+    InlineKeyboardMarkup,
+    InlineKeyboardButton,
+    CallbackQuery,
+    Chat
 )
 from pyrogram.errors import (
     FloodWait, RPCError, FileReferenceExpired, FileReferenceInvalid,
