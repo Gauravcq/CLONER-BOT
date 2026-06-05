@@ -4,13 +4,20 @@ Telegram Topic Cloner Bot v4.0
 Based on SRC bot methodology: Pyrogram copy_message() — server-side media transfer
 Zero disk download. Handles topics, forums, normal groups, albums, replies, everything.
 """
-from pyromod import listen
 import asyncio
+import sys
 
+# Fix for Python 3.10+ / pyromod compatibility: ensure event loop exists before any import
 try:
-    asyncio.get_event_loop()
+    loop = asyncio.get_event_loop()
+    if loop.is_closed():
+        raise RuntimeError("Loop is closed")
 except RuntimeError:
-    asyncio.set_event_loop(asyncio.new_event_loop())
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+
+# pyromod must be imported AFTER event loop is set
+from pyromod import listen
 import os
 import sys
 import json
