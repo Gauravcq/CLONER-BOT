@@ -570,7 +570,7 @@ async def clone_topic(
 
 # ====== BOT COMMANDS ======
 
-@app.on_message(filters.command("start"))
+
 async def start_cmd(client: Client, message: Message):
     text = (
         "🤖 **Telegram Topic Cloner Bot v4.0**\n\n"
@@ -905,23 +905,19 @@ async def main():
     )
     
     # Register all handlers
-    @app.on_message(filters.command("start"))
+    
     async def _start(client, message):
         await start_cmd(client, message)
     
-    @app.on_message(filters.command("help"))
     async def _help(client, message):
         await help_cmd(client, message)
     
-    @app.on_message(filters.command("clone"))
     async def _clone(client, message):
         await clone_cmd(client, message)
     
-    @app.on_message(filters.command("cancel"))
     async def _cancel(client, message):
         await cancel_cmd(client, message)
     
-    @app.on_message(filters.command("status"))
     async def _status(client, message):
         await status_cmd(client, message)
     
