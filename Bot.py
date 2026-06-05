@@ -372,7 +372,7 @@ async def get_topic_messages_sorted(client: Client, chat_id: Union[int, str], to
         
         while True:
             r = await client.invoke(
-                raw_types.messages.GetHistory(
+                from pyrogram.raw.functions.messages import GetHistory(
                     peer=peer,
                     offset_id=0,
                     offset_date=0,
